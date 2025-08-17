@@ -18,6 +18,8 @@
             [clojure.tools.logging :as log]
             [cheshire.core :as cheshire]
             [clojure.java.io :as io])
+  (:import [com.zaxxer.hikari HikariDataSource]
+           [com.nulabinc.zxcvbn Zxcvbn])
   (:gen-class))
 
 ;; Configuration
@@ -56,6 +58,63 @@
 (def redis-conn {:pool {} :spec {:host (:redis-host config) :port (:redis-port config)}})
 (defmacro wcar* [& body] `(car/wcar redis-conn ~@body))
 
+(def store-type (atom :redis))
+(def in-memory-store (atom {}))
+
+(defn current-ms [] (System/currentTimeMillis))
+
+(defn my-incr [key ttl-ms]
+  (if (= @store-type :redis)
+    (let [count (wcar* (car/incr key))]
+      (wcar* (car/pexpire key ttl-ms))
+      count)
+    (let [new-store (swap! in-memory-store (fn [store]
+                                              (let [m (get store key)
+                                                    curr (current-ms)
+                                                    expired? (or (nil? m) (<= (:expire m) curr))
+                                                    new-v (if expired? 1 (inc (:value m 0)))
+                                                    new-exp (if expired? (+ curr ttl-ms) (:expire m))]
+                                                (assoc store key {:value new-v :expire new-exp}))))]
+      (get-in new-store [key :value]))))
+
+(defn my-get [key]
+  (if (= @store-type :redis)
+    (wcar* (car/get key))
+    (let [curr (current-ms)
+          m (get @in-memory-store key)]
+      (if (and m (> (:expire m) curr))
+        (:value m)
+        (do (swap! in-memory-store dissoc key) nil)))))
+
+(defn my-set-ex [key val sec]
+  (if (= @store-type :redis)
+    (wcar* (car/set key val :ex sec))
+    (let [ms (* sec 1000)
+          exp (+ (current-ms) ms)]
+      (swap! in-memory-store assoc key {:value val :expire exp}))))
+
+(defn cleanup-rate-limits []
+  (if (= @store-type :redis)
+    (doseq [k (wcar* (car/keys "rate:*"))]
+      (when (<= (wcar* (car/pttl k)) 0)
+        (wcar* (car/del k))))
+    (swap! in-memory-store (fn [store]
+                             (into {} (filter (fn [[k m]]
+                                                (and (.startsWith k "rate:")
+                                                     (> (:expire m) (current-ms))))
+                                              store))))))
+
+(defn cleanup-blacklist []
+  (if (= @store-type :redis)
+    (doseq [k (wcar* (car/keys "blacklist:*"))]
+      (when (<= (wcar* (car/ttl k)) 0)
+        (wcar* (car/del k))))
+    (swap! in-memory-store (fn [store]
+                             (into {} (filter (fn [[k m]]
+                                                (and (.startsWith k "blacklist:")
+                                                     (> (:expire m) (current-ms))))
+                                              store))))))
+
 (defn create-datasource []
   (hikari/make-datasource {:adapter "postgresql"
                            :username (:db-user config)
@@ -91,9 +150,13 @@
       (catch Exception e
         (if (< attempt (:redis-retries config))
           (do (Thread/sleep 5000) (recur (inc attempt)))
-          (throw e))))))
+          (do (log/warn "Redis unavailable, using in-memory fallback for rate limiting and blacklisting")
+              (reset! store-type :memory)))))))
 
 ;; Utilities
+(defn sanitize [s]
+  (str/escape s {\< "&lt;" \> "&gt;" \& "&amp;" \" "&quot;" \' "&#39;"}))
+
 (defn valid-username? [u]
   (and u (re-matches #"^[a-zA-Z0-9_-]{3,30}$" u)))
 
@@ -101,11 +164,15 @@
   (and e (re-matches #"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}" e)))
 
 (defn valid-password? [p]
-  (and p (>= (count p) 8)
-       (re-find #"[A-Z]" p)
-       (re-find #"\d" p)
-       (re-find #"[!@#$%^&*()_+-=]" p)
-       (not (contains? (:common-passwords config) (str/lower-case p)))))
+  (let [z (Zxcvbn.)
+        strength (.measure z p)
+        score (.getScore strength)]
+    (and p (>= (count p) 8)
+         (re-find #"[A-Z]" p)
+         (re-find #"\d" p)
+         (re-find #"[!@#$%^&*()_+-=]" p)
+         (not (contains? (:common-passwords config) (str/lower-case p)))
+         (>= score 2))))
 
 (defn sign-token [claims expiry]
   (jwt/sign claims (:jwt-secret config) {:alg :hs512 :exp (+ (quot (System/currentTimeMillis) 1000) expiry)}))
@@ -143,9 +210,8 @@
           path (:uri req)
           bucket (quot (System/currentTimeMillis) (:rate-limit-window config))
           key (str "rate:ip:" ip ":" path ":" bucket)
-          count (wcar* (car/incr key))
-          ttl (- (:rate-limit-window config) (mod (System/currentTimeMillis) (:rate-limit-window config)))]
-      (wcar* (car/pexpire key ttl))
+          ttl (- (:rate-limit-window config) (mod (System/currentTimeMillis) (:rate-limit-window config)))
+          count (my-incr key ttl)]
       (if (> count (:rate-limit-requests config))
         {:status 429 :body {:error "Rate limit exceeded"}}
         (handler req)))))
@@ -184,7 +250,7 @@
           token (when (and auth (str/starts-with? (str/lower-case auth) "bearer ")) (subs auth 7))]
       (if-not token
         {:status 401 :body {:error "Missing token"}}
-        (if (wcar* (car/get (str "blacklist:" token)))
+        (if (my-get (str "blacklist:" token))
           {:status 401 :body {:error "Blacklisted token"}}
           (let [claims (unsign-token token)]
             (if-not claims
@@ -203,9 +269,9 @@
 
 (defn register-handler [req]
   (let [body (:body req)
-        username (get body "username")
+        username (sanitize (get body "username"))
         password (get body "password")
-        email (get body "email")
+        email (sanitize (get body "email"))
         csrf-token (get body "csrfToken")
         ip (:remote-addr req)]
     (cond
@@ -233,9 +299,8 @@
         ip (:remote-addr req)
         bucket (quot (System/currentTimeMillis) (:rate-limit-window config))
         rate-key (str "rate:login:" (str/lower-case username) ":" bucket)
-        count (wcar* (car/incr rate-key))
-        ttl (- (:rate-limit-window config) (mod (System/currentTimeMillis) (:rate-limit-window config)))]
-    (wcar* (car/pexpire rate-key ttl))
+        ttl (- (:rate-limit-window config) (mod (System/currentTimeMillis) (:rate-limit-window config)))
+        count (my-incr rate-key ttl)]
     (cond
       (> count (:rate-limit-login-attempts config))
       {:status 429 :body {:error "Rate limit exceeded"}}
@@ -276,7 +341,7 @@
           (not claims)
           {:status 401 :body {:error "Invalid/expired refresh token"}}
 
-          (wcar* (car/get (str "blacklist:" refresh-token)))
+          (my-get (str "blacklist:" refresh-token))
           {:status 401 :body {:error "Blacklisted token"}}
 
           :else
@@ -293,7 +358,7 @@
               (let [new-access (sign-token {:username username :token_version db-v} (:token-expiry config))
                     new-refresh (sign-token {:username username :token_version db-v} (:refresh-token-expiry config))
                     ttl (- (:exp claims) (quot (System/currentTimeMillis) 1000))]
-                (wcar* (car/set (str "blacklist:" refresh-token) "1" :ex ttl))
+                (my-set-ex (str "blacklist:" refresh-token) "1" ttl)
                 {:status 200 :body {:token new-access :refreshToken new-refresh}}))))))))
 
 (defn logout-handler [req]
@@ -310,13 +375,13 @@
       (do
         (jdbc/execute! @ds ["UPDATE users SET token_version = token_version + 1 WHERE username = ?" username])
         (let [ttl (- (:exp claims) (quot (System/currentTimeMillis) 1000))]
-          (wcar* (car/set (str "blacklist:" token) "1" :ex ttl)))
+          (my-set-ex (str "blacklist:" token) "1" ttl))
         (audit "logout" username ip {})
         {:status 200 :body {:message "Logged out successfully"}}))))
 
 (defn forgot-handler [req]
   (let [body (:body req)
-        email (get body "email")
+        email (sanitize (get body "email"))
         csrf-token (get body "csrfToken")
         ip (:remote-addr req)]
     (cond
@@ -367,10 +432,29 @@
 
 (defn health-handler [_]
   (let [db-ok (try (jdbc/execute! @ds ["SELECT 1"]) true (catch Exception _ false))
-        redis-ok (try (wcar* (car/ping)) true (catch Exception _ false))]
-    (if (and db-ok redis-ok)
-      {:status 200 :body {:status "ok" :components {:database "ok" :redis "ok"}}}
-      {:status 503 :body {:status "error" :components {:database (if db-ok "ok" "error") :redis (if redis-ok "ok" "degraded")}}})))
+        redis-ok (try (when (= @store-type :redis) (wcar* (car/ping))) true (catch Exception _ false))
+        jwt-ok (let [test-claims {:test 1}
+                     test-token (sign-token test-claims 10)
+                     unsign-claims (unsign-token test-token)]
+                 (and test-token unsign-claims (= (:test unsign-claims) 1)))
+        rate-limit-size (if (= @store-type :redis)
+                          (count (wcar* (car/keys "rate:*")))
+                          (count (filter #(.startsWith ^String % "rate:") (keys @in-memory-store))))
+        pool-stats (let [hikari-pool (.getHikariPoolMXBean ^HikariDataSource @ds)]
+                     (.getTotalConnections hikari-pool))]
+    (if (and db-ok jwt-ok)
+      {:status 200 :body {:status "ok"
+                          :components {:database (if db-ok "ok" "error")
+                                       :redis (if redis-ok "ok" "degraded")
+                                       :jwt (if jwt-ok "ok" "error")
+                                       :rateLimitSize rate-limit-size
+                                       :poolStats pool-stats}}}
+      {:status 503 :body {:status "error"
+                          :components {:database (if db-ok "ok" "error")
+                                       :redis (if redis-ok "ok" "degraded")
+                                       :jwt (if jwt-ok "ok" "error")
+                                       :rateLimitSize rate-limit-size
+                                       :poolStats pool-stats}}})))
 
 ;; App
 (def muuntaja (m/create m/defaults))
@@ -404,13 +488,19 @@
 
 ;; Server
 (def server (atom nil))
+(def cleanup-rate-thread (atom nil))
+(def cleanup-blacklist-thread (atom nil))
 
 (defn start []
   (init-db)
   (init-redis)
+  (reset! cleanup-rate-thread (future (while true (Thread/sleep (:rate-limit-cleanup-interval config)) (cleanup-rate-limits))))
+  (reset! cleanup-blacklist-thread (future (while true (Thread/sleep (:blacklist-cleanup-interval config)) (cleanup-blacklist))))
   (reset! server (jetty/run-jetty #'app {:port (:port config) :join? false})))
 
 (defn stop []
+  (future-cancel @cleanup-rate-thread)
+  (future-cancel @cleanup-blacklist-thread)
   (when @server (.stop @server))
   (when @ds (hikari/close-datasource @ds)))
 
