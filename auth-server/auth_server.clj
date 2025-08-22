@@ -467,7 +467,7 @@
                                        :poolStats pool-stats}}})))
 
 ;; App
-(def muuntaja (m/create m/defaults))
+(def muuntaja (m/create m/default-options))
 
 (def app
   (ring/ring-handler
