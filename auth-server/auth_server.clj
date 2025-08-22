@@ -126,22 +126,28 @@
 
 (defn init-db []
   (loop [attempt 1]
-    (try
-      (reset! ds (create-datasource))
-      (jdbc/execute! @ds ["SELECT 1"])
-      (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS users (username VARCHAR(255) PRIMARY KEY, password VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login TIMESTAMP, token_version BIGINT DEFAULT 0);"])
-      (jdbc/execute! @ds ["CREATE UNIQUE INDEX IF NOT EXISTS users_lower_idx ON users (LOWER(username));"])
-      (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS users_email_idx ON users (email);"])
-      (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS csrf_tokens (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), action VARCHAR(50) NOT NULL, expires_at TIMESTAMP NOT NULL);"])
-      (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS csrf_tokens_expires_idx ON csrf_tokens (expires_at);"])
-      (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS password_resets (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), expires_at TIMESTAMP NOT NULL);"])
-      (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS password_resets_expires_idx ON password_resets (expires_at);"])
-      (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS audit_log (id SERIAL PRIMARY KEY, action VARCHAR(50) NOT NULL, username VARCHAR(255), ip VARCHAR(45), timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, details JSONB);"])
-      (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS audit_log_details_idx ON audit_log USING GIN (details);"])
-      (catch Exception e
-        (if (< attempt (:db-retries config))
-          (do (Thread/sleep 5000) (recur (inc attempt)))
-          (throw e))))))
+    (let [result (try
+                   (reset! ds (create-datasource))
+                   (jdbc/execute! @ds ["SELECT 1"])
+                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS users (username VARCHAR(255) PRIMARY KEY, password VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login TIMESTAMP, token_version BIGINT DEFAULT 0);"])
+                   (jdbc/execute! @ds ["CREATE UNIQUE INDEX IF NOT EXISTS users_lower_idx ON users (LOWER(username));"])
+                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS users_email_idx ON users (email);"])
+                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS csrf_tokens (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), action VARCHAR(50) NOT NULL, expires_at TIMESTAMP NOT NULL);"])
+                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS csrf_tokens_expires_idx ON csrf_tokens (expires_at);"])
+                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS password_resets (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), expires_at TIMESTAMP NOT NULL);"])
+                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS password_resets_expires_idx ON password_resets (expires_at);"])
+                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS audit_log (id SERIAL PRIMARY KEY, action VARCHAR(50) NOT NULL, username VARCHAR(255), ip VARCHAR(45), timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, details JSONB);"])
+                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS audit_log_details_idx ON audit_log USING GIN (details);"])
+                   :success
+                   (catch Exception e
+                     (if (<= attempt (:db-retries config))
+                       :retry
+                       (throw e))))]
+      (if (= result :retry)
+        (do
+          (Thread/sleep 5000)
+          (recur (inc attempt)))
+        result))))
 
 (defn init-redis []
   (loop [attempt 1]
