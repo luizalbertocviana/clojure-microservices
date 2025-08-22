@@ -151,13 +151,17 @@
 
 (defn init-redis []
   (loop [attempt 1]
-    (try
-      (wcar* (car/ping))
-      (catch Exception e
-        (if (< attempt (:redis-retries config))
-          (do (Thread/sleep 5000) (recur (inc attempt)))
-          (do (log/warn "Redis unavailable, using in-memory fallback for rate limiting and blacklisting")
-              (reset! store-type :memory)))))))
+    (let [result (try
+                   (wcar* (car/ping))
+                   (catch Exception e
+                     ::error))]
+      (if (and (= result ::error) (< attempt (:redis-retries config)))
+        (do
+          (Thread/sleep 5000)
+          (recur (inc attempt)))
+        (when (= result ::error)
+          (log/warn "Redis unavailable, using in-memory fallback for rate limiting and blacklisting")
+          (reset! store-type :memory))))))
 
 ;; Utilities
 (defn sanitize [s]
