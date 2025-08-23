@@ -2,7 +2,6 @@
   (:require [ring.adapter.jetty :as jetty]
             [reitit.ring :as ring]
             [reitit.coercion.spec]
-            [reitit.ring.coercion :as coercion]
             [reitit.ring.middleware.muuntaja :as muuntaja]
             [reitit.ring.middleware.exception :as exception]
             [reitit.ring.middleware.parameters :as parameters]
@@ -11,13 +10,12 @@
             [environ.core :refer [env]]
             [next.jdbc :as jdbc]
             [hikari-cp.core :as hikari]
-            [taoensso.carmine :as car :refer [wcar]]
+            [taoensso.carmine :as car]
             [buddy.sign.jwt :as jwt]
             [buddy.hashers :as hashers]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
-            [cheshire.core :as cheshire]
-            [clojure.java.io :as io])
+            [cheshire.core :as cheshire])
   (:import [com.zaxxer.hikari HikariDataSource]
            [com.nulabinc.zxcvbn Zxcvbn])
   (:gen-class))
