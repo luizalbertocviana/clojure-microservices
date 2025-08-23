@@ -494,7 +494,7 @@
                                       :access-control-allow-origin (:allowed-origins config)
                                       :access-control-allow-methods [:get :post :options]
                                       :access-control-allow-headers ["Content-Type" "Authorization" "X-CSRF-Token"]))]}})
-   (ring/create-default-handler {:not-found (constantly {:status 404 :body {:error "Not found"}})})))
+   (ring/create-default-handler {:not-found (constantly {:status 404 :headers {"Content-Type" "application/json"} :body (cheshire/encode {:error "Not found"})})})))
 
 ;; Server
 (def server (atom nil))
