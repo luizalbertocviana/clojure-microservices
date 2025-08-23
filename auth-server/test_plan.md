@@ -175,4 +175,5 @@ To isolate units under test:
 1. ~~Create the test directory structure~~ (Completed)
 2. ~~Add test dependencies to project configuration~~ (Completed)
 3. ~~Begin implementing tests for utility functions~~ (Completed)
-4. Set up CI configuration for automated testing
+4. Implement tests for middleware components
+5. Set up CI configuration for automated testing
