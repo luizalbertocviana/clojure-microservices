@@ -17,8 +17,28 @@
             [clojure.tools.logging :as log]
             [cheshire.core :as cheshire])
   (:import [com.zaxxer.hikari HikariDataSource]
+           [ch.qos.logback.classic Level Logger]
+           [org.slf4j LoggerFactory]
            [com.nulabinc.zxcvbn Zxcvbn])
   (:gen-class))
+
+(defn set-log-level
+  "Sets the log level for a given logger name (or root logger if nil)."
+  [logger-name level]
+  (let [level (case (str/upper-case (name level))
+                "TRACE" Level/TRACE
+                "DEBUG" Level/DEBUG
+                "INFO" Level/INFO
+                "WARN" Level/WARN
+                "ERROR" Level/ERROR
+                (throw (IllegalArgumentException. (str "Invalid log level: " level))))
+        logger (if logger-name
+                 (LoggerFactory/getLogger logger-name)
+                 (LoggerFactory/getLogger Logger/ROOT_LOGGER_NAME))]
+    (.setLevel logger level)
+    (log/infof "Set log level for %s to %s" (or logger-name "root") (.toString level))))
+
+(set-log-level nil :info)
 
 ;; Configuration
 (def config
@@ -519,5 +539,6 @@
   (start))
 
 (comment
+  (set-log-level nil :info)
   (stop)
   (start))
