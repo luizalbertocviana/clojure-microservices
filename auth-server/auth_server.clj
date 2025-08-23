@@ -471,30 +471,32 @@
 
 (def app
   (ring/ring-handler
-    (ring/router
-      [["/csrf/{action}" {:get csrf-handler}]
-       ["/register" {:post register-handler}]
-       ["/login" {:post login-handler}]
-       ["/refresh" {:post refresh-handler}]
-       ["/validate" {:get {:middleware [auth-middleware]
-                           :handler (fn [req] {:status 200 :body {:username (get-in req [:identity :username])}})}}]
-       ["/logout" {:post {:middleware [auth-middleware]
-                          :handler logout-handler}}]
-       ["/forgot-password" {:post forgot-handler}]
-       ["/reset-password" {:post reset-handler}]
-       ["/health" {:get health-handler}]]
-      {:data {:muuntaja muuntaja
-              :coercion reitit.coercion.spec/coercion
-              :middleware [parameters/parameters-middleware
-                           muuntaja/format-middleware
-                           exception/exception-middleware
-                           rate-limit-middleware
-                           secure-headers-middleware
-                           logger-middleware
-                           (wrap-cors :access-control-allow-origin (:allowed-origins config)
+   (ring/router
+    [["/csrf/{action}" {:get csrf-handler}]
+     ["/register" {:post register-handler}]
+     ["/login" {:post login-handler}]
+     ["/refresh" {:post refresh-handler}]
+     ["/validate" {:get {:middleware [auth-middleware]
+                         :handler (fn [req] {:status 200 :body {:username (get-in req [:identity :username])}})}}]
+     ["/logout" {:post {:middleware [auth-middleware]
+                        :handler logout-handler}}]
+     ["/forgot-password" {:post forgot-handler}]
+     ["/reset-password" {:post reset-handler}]
+     ["/health" {:get health-handler}]]
+    {:data {:muuntaja muuntaja
+            :coercion reitit.coercion.spec/coercion
+            :middleware [parameters/parameters-middleware
+                         muuntaja/format-middleware
+                         exception/exception-middleware
+                         rate-limit-middleware
+                         secure-headers-middleware
+                         logger-middleware
+                         (fn [handler]
+                           (wrap-cors handler
+                                      :access-control-allow-origin (:allowed-origins config)
                                       :access-control-allow-methods [:get :post :options]
-                                      :access-control-allow-headers ["Content-Type" "Authorization" "X-CSRF-Token"])]}})
-    (ring/create-default-handler {:not-found (constantly {:status 404 :body {:error "Not found"}})})))
+                                      :access-control-allow-headers ["Content-Type" "Authorization" "X-CSRF-Token"]))]}})
+   (ring/create-default-handler {:not-found (constantly {:status 404 :body {:error "Not found"}})})))
 
 ;; Server
 (def server (atom nil))
