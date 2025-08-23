@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Complete workflow test for the authentication server
 # Tests registration, login, token refresh, and logout
