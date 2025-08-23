@@ -519,3 +519,6 @@
 (defn -main [& _]
   (.addShutdownHook (Runtime/getRuntime) (Thread. stop))
   (start))
+
+(comment
+  (start))
