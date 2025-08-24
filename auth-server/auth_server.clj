@@ -552,7 +552,6 @@
             (audit "password_reset_requested" (:username user) ip {:email email})
             {:status 200 :body {:message "If the email exists, a reset link has been sent" :resetToken token}})
           (do
-            (str (java.util.UUID/randomUUID))
             (log/info "Password reset requested for non-existent email" {:email email :ip ip})
             {:status 200 :body {:message "If the email exists, a reset link has been sent"}}))))))
 
