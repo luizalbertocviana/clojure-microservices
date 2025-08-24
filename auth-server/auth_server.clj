@@ -9,6 +9,7 @@
             [ring.middleware.cors :refer [wrap-cors]]
             [environ.core :refer [env]]
             [next.jdbc :as jdbc]
+            [next.jdbc.result-set :as rs]
             [hikari-cp.core :as hikari]
             [taoensso.carmine :as car]
             [buddy.sign.jwt :as jwt]
@@ -287,7 +288,7 @@
   (log/info "Logged audit event" {:action action :username username :ip ip :details details}))
 
 (defn get-db-token-version [username]
-  (let [version (:token_version (jdbc/execute-one! @ds ["SELECT token_version FROM users WHERE username = ?" username]))]
+  (let [version (:token_version (jdbc/execute-one! @ds ["SELECT token_version FROM users WHERE username = ?" username] {:builder-fn rs/as-unqualified-maps}))]
     (log/debug "Retrieved token version" {:username username :version version})
     version))
 
@@ -410,10 +411,10 @@
         {:status 201 :body {:message "User registered successfully"}}))))
 
 (defn login-handler [req]
-  (let [body (:body req)
-        username (get body "username")
-        password (get body "password")
-        csrf-token (get body "csrfToken")
+  (let [body (:body-params req)
+        username (get body :username)
+        password (get body :password)
+        csrf-token (get body :csrfToken)
         ip (:remote-addr req)
         bucket (quot (System/currentTimeMillis) (:rate-limit-window config))
         rate-key (str "rate:login:" (str/lower-case username) ":" bucket)
@@ -432,7 +433,7 @@
         {:status 401 :body {:error "Invalid/missing CSRF token"}})
 
       :else
-      (let [user (jdbc/execute-one! @ds ["SELECT * FROM users WHERE LOWER(username) = LOWER(?)" username])]
+      (let [user (jdbc/execute-one! @ds ["SELECT * FROM users WHERE LOWER(username) = LOWER(?)" username] {:builder-fn rs/as-unqualified-maps})]
         (if-not user
           (do
             (hashers/derive password {:alg :bcrypt+sha512 :iterations (:bcrypt-rounds config)})
@@ -456,9 +457,9 @@
               {:status 200 :body {:token access :refreshToken refresh :csrfToken new-csrf}})))))))
 
 (defn refresh-handler [req]
-  (let [body (:body req)
-        refresh-token (get body "refreshToken")
-        csrf-token (get body "csrfToken")
+  (let [body (:body-params req)
+        refresh-token (get body :refreshToken)
+        csrf-token (get body :csrfToken)
         ip (:remote-addr req)]
     (log/info "Processing token refresh request" {:ip ip})
     (cond
@@ -710,6 +711,6 @@
 
 (comment
   (set-log-level nil :info)
-  (set-log-level "auth-server" :info)
+  (set-log-level "auth-server" :debug)
   (stop)
   (start))
