@@ -378,11 +378,11 @@
     {:status 200 :body {:csrfToken (generate-csrf username action)}}))
 
 (defn register-handler [req]
-  (let [body (:body req)
-        username (sanitize (get body "username"))
-        password (get body "password")
-        email (sanitize (get body "email"))
-        csrf-token (get body "csrfToken")
+  (let [body (:body-params req)
+        username (sanitize (get body :username))
+        password (get body :password)
+        email (sanitize (get body :email))
+        csrf-token (get body :csrfToken)
         ip (:remote-addr req)]
     (log/info "Processing registration request" {:username username :email email :ip ip})
     (cond
@@ -710,6 +710,6 @@
 
 (comment
   (set-log-level nil :info)
-  (set-log-level "auth-server" :debug)
+  (set-log-level "auth-server" :info)
   (stop)
   (start))
