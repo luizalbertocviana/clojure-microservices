@@ -208,13 +208,30 @@ The project includes comprehensive end-to-end tests in the `actions/` directory:
 - `test_rate_limiting.sh`: Tests rate limiting features
 - `test_server_health.sh`: Tests server health endpoints
 - `test_input_validation.sh`: Tests input validation
+- `test_token_validation.sh`: Tests token validation endpoint
+- `test_csrf_expiration.sh`: Tests CSRF token expiration and reuse
+- `test_refresh_token_edge_cases.sh`: Tests refresh token edge cases
+- `test_logout_edge_cases.sh`: Tests logout edge cases
+- `test_password_reset_edge_cases.sh`: Tests password reset edge cases
+- `test_security_headers.sh`: Tests security and CORS headers
+- `test_audit_logging.sh`: Tests audit logging functionality
+- `run_all_tests.sh`: Dynamic test runner that executes all tests
 
-To run the tests:
+To run individual tests:
 ```bash
 cd actions
 chmod +x *.sh
 ./test_complete_workflow.sh
 ```
+
+To run all tests at once:
+```bash
+cd actions
+chmod +x *.sh
+./run_all_tests.sh
+```
+
+The `run_all_tests.sh` script automatically discovers and runs all other test scripts in the directory, making it easy to execute the entire test suite without hardcoding script names.
 
 ## Database Schema
 
