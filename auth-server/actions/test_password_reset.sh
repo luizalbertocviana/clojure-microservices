@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Test script for password reset functionality
 

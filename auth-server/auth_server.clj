@@ -245,7 +245,7 @@
         valid (and p (>= (count p) 8)
                    (re-find #"[A-Z]" p)
                    (re-find #"\d" p)
-                   (re-find #"[!@#$%^&*()_+-=]" p)
+                   (re-find #"[!@#$%^&*()_+\-=]" p)
                    (not (contains? (:common-passwords config) (str/lower-case p)))
                    (>= score 2))]
     (log/debug "Password validation" {:score score :valid valid})
@@ -526,9 +526,9 @@
         {:status 200 :body {:message "Logged out successfully"}}))))
 
 (defn forgot-handler [req]
-  (let [body (:body req)
-        email (sanitize (get body "email"))
-        csrf-token (get body "csrfToken")
+  (let [body (:body-params req)
+        email (sanitize (get body :email))
+        csrf-token (get body :csrfToken)
         ip (:remote-addr req)]
     (log/info "Processing forgot password request" {:email email :ip ip})
     (cond
@@ -543,7 +543,7 @@
         {:status 401 :body {:error "Invalid/missing CSRF token"}})
 
       :else
-      (let [user (jdbc/execute-one! @ds ["SELECT username FROM users WHERE email = ?" email])]
+      (let [user (jdbc/execute-one! @ds ["SELECT username FROM users WHERE email = ?" email] {:builder-fn rs/as-unqualified-maps})]
         (if user
           (let [token (str (java.util.UUID/randomUUID))
                 expires (java.sql.Timestamp. (+ (System/currentTimeMillis) (* (:password-reset-expiry config) 1000)))]
@@ -557,10 +557,10 @@
             {:status 200 :body {:message "If the email exists, a reset link has been sent"}}))))))
 
 (defn reset-handler [req]
-  (let [body (:body req)
-        token (get body "token")
-        new-password (get body "newPassword")
-        csrf-token (get body "csrfToken")
+  (let [body (:body-params req)
+        token (get body :token)
+        new-password (get body :newPassword)
+        csrf-token (get body :csrfToken)
         ip (:remote-addr req)]
     (log/info "Processing password reset request" {:ip ip})
     (cond
@@ -570,7 +570,7 @@
         {:status 400 :body {:error "Invalid input"}})
 
       :else
-      (let [reset (jdbc/execute-one! @ds ["SELECT username FROM password_resets WHERE token = ? AND expires_at > NOW()" token])]
+      (let [reset (jdbc/execute-one! @ds ["SELECT username FROM password_resets WHERE token = ? AND expires_at > NOW()" token] {:builder-fn rs/as-unqualified-maps})]
         (cond
           (not reset)
           (do

@@ -74,7 +74,7 @@ test_login_rate_limiting() {
             break
         else
             echo "Attempt $i: Login failed as expected (wrong password)"
-            sleep 0.5  # Small delay to avoid overwhelming the server
+            sleep 0.1  # Small delay to avoid overwhelming the server
         fi
     done
     
@@ -97,7 +97,7 @@ test_general_rate_limiting() {
         
         if echo "$response" | jq -e '.status' > /dev/null; then
             echo "Request $i: Health check successful"
-        elif echo "$response" | grep -q "429"; then
+        elif echo "$response" | jq -e '.error | contains("Rate limit")' > /dev/null; then
             print_success "General rate limit correctly triggered on request $i"
             rate_limit_triggered=true
             break
