@@ -22,26 +22,36 @@
            [com.nulabinc.zxcvbn Zxcvbn])
   (:gen-class))
 
-(defn set-log-level
-  "Sets the log level for a given logger name (or root logger if nil)."
-  [logger-name level]
-  (let [level (case (str/upper-case (name level))
-                "TRACE" Level/TRACE
-                "DEBUG" Level/DEBUG
-                "INFO" Level/INFO
-                "WARN" Level/WARN
-                "ERROR" Level/ERROR
-                (throw (IllegalArgumentException. (str "Invalid log level: " level))))
-        logger (if logger-name
-                 (LoggerFactory/getLogger logger-name)
-                 (LoggerFactory/getLogger Logger/ROOT_LOGGER_NAME))]
-    (.setLevel logger level)
-    (log/infof "Set log level for %s to %s" (or logger-name "root") (.toString level))))
-
-(set-log-level nil :info)
+;; Constants
+(def ^:private jwt-algorithm :hs512)
+(def ^:private login-delay-ms 500)
+(def ^:private sql-queries
+  {:create-users-table "CREATE TABLE IF NOT EXISTS users (username VARCHAR(255) PRIMARY KEY, password VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login TIMESTAMP, token_version BIGINT DEFAULT 0)"
+   :create-users-lower-idx "CREATE UNIQUE INDEX IF NOT EXISTS users_lower_idx ON users (LOWER(username))"
+   :create-users-email-idx "CREATE INDEX IF NOT EXISTS users_email_idx ON users (email)"
+   :create-csrf-table "CREATE TABLE IF NOT EXISTS csrf_tokens (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), action VARCHAR(50) NOT NULL, expires_at TIMESTAMP NOT NULL)"
+   :create-csrf-expires-idx "CREATE INDEX IF NOT EXISTS csrf_tokens_expires_idx ON csrf_tokens (expires_at)"
+   :create-password-resets-table "CREATE TABLE IF NOT EXISTS password_resets (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), expires_at TIMESTAMP NOT NULL)"
+   :create-password-resets-expires-idx "CREATE INDEX IF NOT EXISTS password_resets_expires_idx ON password_resets (expires_at)"
+   :create-audit-log-table "CREATE TABLE IF NOT EXISTS audit_log (id SERIAL PRIMARY KEY, action VARCHAR(50) NOT NULL, username VARCHAR(255), ip VARCHAR(45), timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, details JSONB)"
+   :create-audit-log-details-idx "CREATE INDEX IF NOT EXISTS audit_log_details_idx ON audit_log USING GIN (details)"
+   :find-user-by-username "SELECT * FROM users WHERE LOWER(username) = LOWER(?)"
+   :find-user-by-email "SELECT username FROM users WHERE email = ?"
+   :insert-user "INSERT INTO users (username, password, email) VALUES (?, ?, ?)"
+   :update-user-password "UPDATE users SET password = ?, token_version = token_version + 1 WHERE username = ?"
+   :update-user-last-login "UPDATE users SET last_login = NOW() WHERE username = ?"
+   :update-user-token-version "UPDATE users SET token_version = token_version + 1 WHERE username = ?"
+   :insert-csrf-token "INSERT INTO csrf_tokens (token, username, action, expires_at) VALUES (?, ?, ?, ?)"
+   :find-csrf-token "SELECT * FROM csrf_tokens WHERE token = ? AND (username = ? OR username IS NULL) AND action = ? AND expires_at > NOW()"
+   :delete-csrf-token "DELETE FROM csrf_tokens WHERE token = ?"
+   :insert-password-reset "INSERT INTO password_resets (token, username, expires_at) VALUES (?, ?, ?)"
+   :find-password-reset "SELECT username FROM password_resets WHERE token = ? AND expires_at > NOW()"
+   :delete-password-reset "DELETE FROM password_resets WHERE token = ?"
+   :insert-audit-log "INSERT INTO audit_log (action, username, ip, details) VALUES (?, ?, ?, ?::jsonb)"
+   :test-connection "SELECT 1"})
 
 ;; Configuration
-(def config
+(def ^:private config
   (let [cfg {:port (or (some-> (env :port) Integer/parseInt) 8000)
              :jwt-secret (env :jwt-secret)
              :token-expiry (or (some-> (env :token-expiry) Integer/parseInt) 3600)
@@ -74,86 +84,76 @@
     cfg))
 
 ;; Database and Redis
-(def ds (atom nil))
-(def redis-conn {:pool {} :spec {:host (:redis-host config) :port (:redis-port config)}})
-(defmacro wcar* [& body] `(car/wcar redis-conn ~@body))
+(def ^:private ds (atom nil))
+(def ^:private redis-conn {:pool {} :spec {:host (:redis-host config) :port (:redis-port config)}})
+(defmacro ^:private wcar* [& body] `(car/wcar redis-conn ~@body))
 
-(def store-type (atom :redis))
-(def in-memory-store (atom {}))
+(defn- set-log-level
+  "Sets the log level for a given logger name (or root logger if nil)."
+  [logger-name level]
+  (let [level (case (str/upper-case (name level))
+                "TRACE" Level/TRACE
+                "DEBUG" Level/DEBUG
+                "INFO" Level/INFO
+                "WARN" Level/WARN
+                "ERROR" Level/ERROR
+                (throw (IllegalArgumentException. (str "Invalid log level: " level))))
+        logger (if logger-name
+                 (LoggerFactory/getLogger logger-name)
+                 (LoggerFactory/getLogger Logger/ROOT_LOGGER_NAME))]
+    (.setLevel logger level)
+    (log/infof "Set log level for %s to %s" (or logger-name "root") (.toString level))))
 
-(defn current-ms [] (System/currentTimeMillis))
+(set-log-level nil :info)
 
-(defn my-incr [key ttl-ms]
-  (if (= @store-type :redis)
-    (let [count (wcar* (car/incr key))]
-      (wcar* (car/pexpire key ttl-ms))
-      (log/debug "Incremented Redis key" {:key key :count count :ttl-ms ttl-ms})
-      count)
-    (let [new-store (swap! in-memory-store (fn [store]
-                                              (let [m (get store key)
-                                                    curr (current-ms)
-                                                    expired? (or (nil? m) (<= (:expire m) curr))
-                                                    new-v (if expired? 1 (inc (:value m 0)))
-                                                    new-exp (if expired? (+ curr ttl-ms) (:expire m))]
-                                                (assoc store key {:value new-v :expire new-exp}))))]
-      (log/debug "Incremented in-memory key" {:key key :count (get-in new-store [key :value]) :ttl-ms ttl-ms})
-      (get-in new-store [key :value]))))
+(defn- current-ms
+  "Returns the current time in milliseconds."
+  [] (System/currentTimeMillis))
 
-(defn my-get [key]
-  (if (= @store-type :redis)
-    (let [value (wcar* (car/get key))]
-      (log/debug "Retrieved Redis key" {:key key :value value})
-      value)
-    (let [curr (current-ms)
-          m (get @in-memory-store key)]
-      (if (and m (> (:expire m) curr))
-        (do
-          (log/debug "Retrieved in-memory key" {:key key :value (:value m)})
-          (:value m))
-        (do
-          (log/debug "Expired or missing in-memory key" {:key key})
-          (swap! in-memory-store dissoc key)
-          nil)))))
+(defn- my-incr
+  "Increments a Redis key and sets its expiry."
+  [key ttl-ms]
+  (let [count (wcar* (car/incr key))]
+    (wcar* (car/pexpire key ttl-ms))
+    (log/debug "Incremented Redis key" {:key key :count count :ttl-ms ttl-ms})
+    count))
 
-(defn my-set-ex [key val sec]
-  (if (= @store-type :redis)
-    (do
-      (wcar* (car/set key val :ex sec))
-      (log/debug "Set Redis key with expiry" {:key key :value val :expiry-sec sec}))
-    (let [ms (* sec 1000)
-          exp (+ (current-ms) ms)]
-      (swap! in-memory-store assoc key {:value val :expire exp})
-      (log/debug "Set in-memory key with expiry" {:key key :value val :expiry-ms ms}))))
+(defn- my-get
+  "Retrieves a value from Redis by key."
+  [key]
+  (let [value (wcar* (car/get key))]
+    (log/debug "Retrieved Redis key" {:key key :value value})
+    value))
 
-(defn cleanup-rate-limits []
+(defn- my-set-ex
+  "Sets a Redis key with a value and expiry."
+  [key val sec]
+  (wcar* (car/set key val :ex sec))
+  (log/debug "Set Redis key with expiry" {:key key :value val :expiry-sec sec}))
+
+(defn- cleanup-rate-limits
+  "Cleans up expired rate limit keys in Redis."
+  []
   (log/info "Starting rate limit cleanup")
-  (if (= @store-type :redis)
-    (doseq [k (wcar* (car/keys "rate:*"))]
-      (when (<= (wcar* (car/pttl k)) 0)
-        (wcar* (car/del k))
-        (log/debug "Deleted expired Redis rate limit key" {:key k})))
-    (swap! in-memory-store (fn [store]
-                             (into {} (filter (fn [[k m]]
-                                                (and (.startsWith k "rate:")
-                                                     (> (:expire m) (current-ms))))
-                                              store)))))
+  (doseq [k (wcar* (car/keys "rate:*"))]
+    (when (<= (wcar* (car/pttl k)) 0)
+      (wcar* (car/del k))
+      (log/debug "Deleted expired Redis rate limit key" {:key k})))
   (log/info "Completed rate limit cleanup"))
 
-(defn cleanup-blacklist []
+(defn- cleanup-blacklist
+  "Cleans up expired blacklist keys in Redis."
+  []
   (log/info "Starting blacklist cleanup")
-  (if (= @store-type :redis)
-    (doseq [k (wcar* (car/keys "blacklist:*"))]
-      (when (<= (wcar* (car/ttl k)) 0)
-        (wcar* (car/del k))
-        (log/debug "Deleted expired Redis blacklist key" {:key k})))
-    (swap! in-memory-store (fn [store]
-                             (into {} (filter (fn [[k m]]
-                                                (and (.startsWith k "blacklist:")
-                                                     (> (:expire m) (current-ms))))
-                                              store)))))
+  (doseq [k (wcar* (car/keys "blacklist:*"))]
+    (when (<= (wcar* (car/ttl k)) 0)
+      (wcar* (car/del k))
+      (log/debug "Deleted expired Redis blacklist key" {:key k})))
   (log/info "Completed blacklist cleanup"))
 
-(defn create-datasource []
+(defn- create-datasource
+  "Creates a HikariCP datasource for PostgreSQL."
+  []
   (log/info "Creating database datasource" {:host (:db-host config) :port (:db-port config) :db-name (:db-name config)})
   (hikari/make-datasource {:adapter "postgresql"
                            :username (:db-user config)
@@ -163,34 +163,42 @@
                            :port-number (:db-port config)
                            :maximum-pool-size (:db-pool-size config)}))
 
-(defn init-db []
+(defn- init-tables
+  "Initializes database schema (tables and indexes)."
+  [ds]
+  (jdbc/execute! ds [(:create-users-table sql-queries)])
+  (log/debug "Created users table if not exists")
+  (jdbc/execute! ds [(:create-users-lower-idx sql-queries)])
+  (log/debug "Created users_lower_idx index")
+  (jdbc/execute! ds [(:create-users-email-idx sql-queries)])
+  (log/debug "Created users_email_idx index")
+  (jdbc/execute! ds [(:create-csrf-table sql-queries)])
+  (log/debug "Created csrf_tokens table")
+  (jdbc/execute! ds [(:create-csrf-expires-idx sql-queries)])
+  (log/debug "Created csrf_tokens_expires_idx index")
+  (jdbc/execute! ds [(:create-password-resets-table sql-queries)])
+  (log/debug "Created password_resets table")
+  (jdbc/execute! ds [(:create-password-resets-expires-idx sql-queries)])
+  (log/debug "Created password_resets_expires_idx index")
+  (jdbc/execute! ds [(:create-audit-log-table sql-queries)])
+  (log/debug "Created audit_log table")
+  (jdbc/execute! ds [(:create-audit-log-details-idx sql-queries)])
+  (log/debug "Created audit_log_details_idx index"))
+
+(defn- init-db
+  "Initializes the database connection with retries."
+  []
   (log/info "Initializing database connection")
   (loop [attempt 1]
     (let [result (try
-                   (reset! ds (create-datasource))
-                   (jdbc/execute! @ds ["SELECT 1"])
-                   (log/info "Database connection test successful")
-                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS users (username VARCHAR(255) PRIMARY KEY, password VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login TIMESTAMP, token_version BIGINT DEFAULT 0);"])
-                   (log/debug "Created users table if not exists")
-                   (jdbc/execute! @ds ["CREATE UNIQUE INDEX IF NOT EXISTS users_lower_idx ON users (LOWER(username));"])
-                   (log/debug "Created users_lower_idx index")
-                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS users_email_idx ON users (email);"])
-                   (log/debug "Created users_email_idx index")
-                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS csrf_tokens (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), action VARCHAR(50) NOT NULL, expires_at TIMESTAMP NOT NULL);"])
-                   (log/debug "Created csrf_tokens table")
-                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS csrf_tokens_expires_idx ON csrf_tokens (expires_at);"])
-                   (log/debug "Created csrf_tokens_expires_idx index")
-                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS password_resets (token VARCHAR(64) PRIMARY KEY, username VARCHAR(255) REFERENCES users(username), expires_at TIMESTAMP NOT NULL);"])
-                   (log/debug "Created password_resets table")
-                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS password_resets_expires_idx ON password_resets (expires_at);"])
-                   (log/debug "Created password_resets_expires_idx index")
-                   (jdbc/execute! @ds ["CREATE TABLE IF NOT EXISTS audit_log (id SERIAL PRIMARY KEY, action VARCHAR(50) NOT NULL, username VARCHAR(255), ip VARCHAR(45), timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, details JSONB);"])
-                   (log/debug "Created audit_log table")
-                   (jdbc/execute! @ds ["CREATE INDEX IF NOT EXISTS audit_log_details_idx ON audit_log USING GIN (details);"])
-                   (log/debug "Created audit_log_details_idx index")
-                   (log/info "Database schema initialized successfully")
-                   :success
-                   (catch Exception e
+                   (let [new-ds (create-datasource)]
+                     (reset! ds new-ds)
+                     (jdbc/execute! @ds [(:test-connection sql-queries)])
+                     (log/info "Database connection test successful")
+                     (init-tables @ds)
+                     (log/info "Database schema initialized successfully")
+                     :success)
+                   (catch java.sql.SQLException e
                      (log/error "Database initialization failed" {:attempt attempt :error (.getMessage e)})
                      (if (<= attempt (:db-retries config))
                        :retry
@@ -198,11 +206,13 @@
       (if (= result :retry)
         (do
           (log/warn "Retrying database initialization" {:attempt (inc attempt)})
-          (Thread/sleep 5000)
+          (Thread/sleep login-delay-ms)
           (recur (inc attempt)))
         result))))
 
-(defn init-redis []
+(defn- init-redis
+  "Initializes the Redis connection with retries."
+  []
   (log/info "Initializing Redis connection" {:host (:redis-host config) :port (:redis-port config)})
   (loop [attempt 1]
     (let [result (try
@@ -211,33 +221,120 @@
                    :success
                    (catch Exception e
                      (log/error "Redis connection failed" {:attempt attempt :error (.getMessage e)})
-                     ::error))]
-      (if (and (= result ::error) (< attempt (:redis-retries config)))
+                     (if (< attempt (:redis-retries config))
+                       :retry
+                       (throw (ex-info "Redis initialization failed after retries" {:error (.getMessage e)})))))]
+      (if (= result :retry)
         (do
           (log/warn "Retrying Redis connection" {:attempt (inc attempt)})
-          (Thread/sleep 5000)
+          (Thread/sleep login-delay-ms)
           (recur (inc attempt)))
-        (when (= result ::error)
-          (log/warn "Redis unavailable, using in-memory fallback for rate limiting and blacklisting")
-          (reset! store-type :memory))))))
+        result))))
 
-;; Utilities
-(defn sanitize [s]
+;; Crypto Utilities
+(defn- sign
+  "Signs a JWT with the given claims and expiry."
+  [claims secret expiry]
+  (jwt/sign claims secret {:alg jwt-algorithm :exp (+ (quot (current-ms) 1000) expiry)}))
+
+(defn- unsign
+  "Unsigs a JWT and returns its claims, or nil if invalid."
+  [token secret]
+  (try
+    (jwt/unsign token secret {:alg jwt-algorithm})
+    (catch Exception _ nil)))
+
+;; Database Utilities
+(defn- find-user-by-username
+  "Finds a user by username (case-insensitive)."
+  [ds username]
+  (jdbc/execute-one! ds [(:find-user-by-username sql-queries) username] {:builder-fn rs/as-unqualified-maps}))
+
+(defn- find-user-by-email
+  "Finds a user by email."
+  [ds email]
+  (jdbc/execute-one! ds [(:find-user-by-email sql-queries) email] {:builder-fn rs/as-unqualified-maps}))
+
+(defn- create-user
+  "Inserts a new user into the database."
+  [ds username password email]
+  (jdbc/execute! ds [(:insert-user sql-queries) username password email]))
+
+(defn- update-user-password
+  "Updates a user's password and increments token version."
+  [ds username password]
+  (jdbc/execute! ds [(:update-user-password sql-queries) password username]))
+
+(defn- update-user-last-login
+  "Updates a user's last login timestamp."
+  [ds username]
+  (jdbc/execute! ds [(:update-user-last-login sql-queries) username]))
+
+(defn- update-user-token-version
+  "Increments a user's token version."
+  [ds username]
+  (jdbc/execute! ds [(:update-user-token-version sql-queries) username]))
+
+(defn- insert-csrf-token
+  "Inserts a CSRF token into the database."
+  [ds token username action expires]
+  (jdbc/execute! ds [(:insert-csrf-token sql-queries) token username action expires]))
+
+(defn- find-csrf-token
+  "Finds a CSRF token by token, username, and action."
+  [ds token username action]
+  (jdbc/execute-one! ds [(:find-csrf-token sql-queries) token username action]))
+
+(defn- delete-csrf-token
+  "Deletes a CSRF token from the database."
+  [ds token]
+  (jdbc/execute! ds [(:delete-csrf-token sql-queries) token]))
+
+(defn- insert-password-reset
+  "Inserts a password reset token into the database."
+  [ds token username expires]
+  (jdbc/execute! ds [(:insert-password-reset sql-queries) token username expires]))
+
+(defn- find-password-reset
+  "Finds a password reset token."
+  [ds token]
+  (jdbc/execute-one! ds [(:find-password-reset sql-queries) token] {:builder-fn rs/as-unqualified-maps}))
+
+(defn- delete-password-reset
+  "Deletes a password reset token."
+  [ds token]
+  (jdbc/execute! ds [(:delete-password-reset sql-queries) token]))
+
+(defn- insert-audit-log
+  "Inserts an audit log entry."
+  [ds action username ip details]
+  (jdbc/execute! ds [(:insert-audit-log sql-queries) action username ip (cheshire/generate-string details)]))
+
+;; General Utilities
+(defn- sanitize
+  "Sanitizes input to prevent XSS."
+  [s]
   (let [sanitized (str/escape s {\< "&lt;" \> "&gt;" \& "&amp;" \" "&quot;" \' "&#39;"})]
     (log/debug "Sanitized input" {:original s :sanitized sanitized})
     sanitized))
 
-(defn valid-username? [u]
+(defn- valid-username?
+  "Validates a username: 3-30 characters, alphanumeric, underscore, or hyphen."
+  [u]
   (let [valid (and u (re-matches #"^[a-zA-Z0-9_-]{3,30}$" u))]
     (log/debug "Username validation" {:username u :valid valid})
     valid))
 
-(defn valid-email? [e]
+(defn- valid-email?
+  "Validates an email address format."
+  [e]
   (let [valid (and e (re-matches #"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}" e))]
     (log/debug "Email validation" {:email e :valid valid})
     valid))
 
-(defn valid-password? [p]
+(defn- valid-password?
+  "Validates a password: at least 8 characters, one uppercase, one digit, one special character, not common, and strong enough."
+  [p]
   (let [z (Zxcvbn.)
         strength (.measure z p)
         score (.getScore strength)
@@ -250,70 +347,91 @@
     (log/debug "Password validation" {:score score :valid valid})
     valid))
 
-(defn sign-token [claims expiry]
-  (let [token (jwt/sign claims (:jwt-secret config) {:alg :hs512 :exp (+ (quot (System/currentTimeMillis) 1000) expiry)})]
+(defn- sign-token
+  "Signs a JWT token with user claims."
+  [claims expiry]
+  (let [token (sign claims (:jwt-secret config) expiry)]
     (log/debug "Signed JWT token" {:claims claims :expiry expiry})
     token))
 
-(defn unsign-token [token]
-  (try
-    (let [claims (jwt/unsign token (:jwt-secret config) {:alg :hs512})]
-      (log/debug "Unsigned JWT token" {:claims claims})
-      claims)
-    (catch Exception e
-      (log/warn "Failed to unsign JWT token" {:error (.getMessage e)})
-      nil)))
+(defn- unsign-token
+  "Unsigs a JWT token and returns its claims."
+  [token]
+  (let [claims (unsign token (:jwt-secret config))]
+    (log/debug "Unsigned JWT token" {:claims claims})
+    claims))
 
-(defn generate-csrf [username action]
+(defn- generate-csrf
+  "Generates a CSRF token for a user and action."
+  [ds username action]
   (let [token (str (java.util.UUID/randomUUID))
-        expires (java.sql.Timestamp. (+ (System/currentTimeMillis) (* (:csrf-token-expiry config) 1000)))]
-    (jdbc/execute! @ds ["INSERT INTO csrf_tokens (token, username, action, expires_at) VALUES (?, ?, ?, ?)" token username action expires])
+        expires (java.sql.Timestamp. (+ (current-ms) (* (:csrf-token-expiry config) 1000)))]
+    (insert-csrf-token ds token username action expires)
     (log/info "Generated CSRF token" {:username username :action action})
     token))
 
-(defn validate-csrf [token username action]
-  (let [row (jdbc/execute-one! @ds ["SELECT * FROM csrf_tokens WHERE token = ? AND (username = ? OR username IS NULL) AND action = ? AND expires_at > NOW()" token username action])]
+(defn- validate-csrf
+  "Validates a CSRF token for a user and action."
+  [ds token username action]
+  (let [row (find-csrf-token ds token username action)]
     (if row
       (do
-        (jdbc/execute! @ds ["DELETE FROM csrf_tokens WHERE token = ?" token])
+        (delete-csrf-token ds token)
         (log/info "Validated CSRF token" {:username username :action action})
         true)
       (do
         (log/warn "Invalid or expired CSRF token" {:username username :action action :token token})
         false))))
 
-(defn audit [action username ip details]
-  (jdbc/execute! @ds ["INSERT INTO audit_log (action, username, ip, details) VALUES (?, ?, ?, ?::jsonb)" action username ip (cheshire/generate-string details)])
+(defn- audit
+  "Logs an audit event."
+  [ds action username ip details]
+  (insert-audit-log ds action username ip details)
   (log/info "Logged audit event" {:action action :username username :ip ip :details details}))
 
-(defn get-db-token-version [username]
-  (let [version (:token_version (jdbc/execute-one! @ds ["SELECT token_version FROM users WHERE username = ?" username] {:builder-fn rs/as-unqualified-maps}))]
+(defn- get-db-token-version
+  "Retrieves the token version for a user."
+  [ds username]
+  (let [version (:token_version (find-user-by-username ds username))]
     (log/debug "Retrieved token version" {:username username :version version})
     version))
 
-(defn user-exists? [username email]
-  (let [exists (boolean (jdbc/execute-one! @ds ["SELECT 1 FROM users WHERE LOWER(username) = LOWER(?) OR email = ?" username email]))]
+(defn- user-exists?
+  "Checks if a user exists by username or email."
+  [ds username email]
+  (let [exists (boolean (or (find-user-by-username ds username)
+                            (find-user-by-email ds email)))]
     (log/debug "Checked user existence" {:username username :email email :exists exists})
     exists))
 
 ;; Middleware
-(defn rate-limit-middleware [handler]
+(defn- check-rate-limit
+  "Checks if the request exceeds the rate limit."
+  [ip path]
+  (let [bucket (quot (current-ms) (:rate-limit-window config))
+        key (str "rate:ip:" ip ":" path ":" bucket)
+        ttl (- (:rate-limit-window config) (mod (current-ms) (:rate-limit-window config)))
+        count (my-incr key ttl)]
+    (if (> count (:rate-limit-requests config))
+      (do
+        (log/warn "Rate limit exceeded" {:ip ip :path path :count count})
+        {:status 429 :body {:error "Rate limit exceeded"}})
+      (do
+        (log/debug "Rate limit check passed" {:ip ip :path path :count count})
+        nil))))
+
+(defn- rate-limit-middleware
+  "Middleware to enforce rate limiting."
+  [handler]
   (fn [req]
     (let [ip (:remote-addr req)
-          path (:uri req)
-          bucket (quot (System/currentTimeMillis) (:rate-limit-window config))
-          key (str "rate:ip:" ip ":" path ":" bucket)
-          ttl (- (:rate-limit-window config) (mod (System/currentTimeMillis) (:rate-limit-window config)))
-          count (my-incr key ttl)]
-      (if (> count (:rate-limit-requests config))
-        (do
-          (log/warn "Rate limit exceeded" {:ip ip :path path :count count})
-          {:status 429 :body {:error "Rate limit exceeded"}})
-        (do
-          (log/debug "Rate limit check passed" {:ip ip :path path :count count})
-          (handler req))))))
+          path (:uri req)]
+      (or (check-rate-limit ip path)
+          (handler req)))))
 
-(defn secure-headers-middleware [handler]
+(defn- secure-headers-middleware
+  "Middleware to add secure HTTP headers."
+  [handler]
   (fn [req]
     (log/debug "Applying secure headers" {:path (:uri req)})
     (let [resp (handler req)]
@@ -323,7 +441,9 @@
           (assoc-in [:headers "X-Content-Type-Options"] "nosniff")
           (assoc-in [:headers "X-Frame-Options"] "DENY")))))
 
-(defn cors-middleware [handler allowed-origins]
+(defn- cors-middleware
+  "Middleware to handle CORS requests."
+  [handler allowed-origins]
   (fn [req]
     (let [headers (into {} (map (fn [[k v]] [(clojure.string/lower-case k) v]) (:headers req)))
           origin (get headers "origin")
@@ -332,12 +452,11 @@
           allowed-methods #{"GET" "POST" "OPTIONS"}
           allowed-headers #{"content-type" "authorization" "x-csrf-token" "x-requested-with"}]
       (if (= (:request-method req) :options)
-        ;; Handle preflight request
         (if (and origin
                  (contains? allowed-origins origin)
                  (or (nil? acrm) (contains? allowed-methods (clojure.string/upper-case acrm)))
-                 (or (nil? acrih) 
-                     (every? #(contains? allowed-headers (clojure.string/lower-case (clojure.string/trim %))) 
+                 (or (nil? acrih)
+                     (every? #(contains? allowed-headers (clojure.string/lower-case (clojure.string/trim %)))
                              (clojure.string/split acrih #","))))
           {:status 200
            :headers {"Access-Control-Allow-Origin" origin
@@ -346,20 +465,21 @@
                      "Access-Control-Max-Age" "86400"
                      "Vary" "Origin"}}
           {:status 403 :body {:error "CORS preflight request denied"}})
-        ;; Handle regular request
         (let [resp (handler req)]
           (if (and origin (contains? allowed-origins origin))
-            (assoc-in resp [:headers] 
+            (assoc-in resp [:headers]
                       (merge (:headers resp)
                              {"Access-Control-Allow-Origin" origin
                               "Vary" "Origin"}))
             resp))))))
 
-(defn logger-middleware [handler]
+(defn- logger-middleware
+  "Middleware to log request details."
+  [handler]
   (fn [req]
-    (let [start (System/currentTimeMillis)
+    (let [start (current-ms)
           resp (handler req)
-          duration (- (System/currentTimeMillis) start)
+          duration (- (current-ms) start)
           username (get-in req [:identity :username])]
       (log/info {:timestamp (java.time.Instant/now)
                  :level "INFO"
@@ -374,192 +494,219 @@
                  :requestId (str (java.util.UUID/randomUUID))})
       resp)))
 
-(defn auth-middleware [handler]
-  (fn [req]
-    (let [auth (get-in req [:headers "authorization"])
-          token (when (and auth (str/starts-with? (str/lower-case auth) "bearer ")) (subs auth 7))]
-      (log/debug "Checking authorization" {:has-auth (boolean auth)})
-      (if-not token
-        (do
-          (log/warn "Missing authorization token" {:path (:uri req) :ip (:remote-addr req)})
-          {:status 401 :body {:error "Missing token"}})
-        (if (my-get (str "blacklist:" token))
+(defn- extract-token
+  "Extracts the JWT token from the Authorization header."
+  [req]
+  (let [auth (get-in req [:headers "authorization"])]
+    (when (and auth (str/starts-with? (str/lower-case auth) "bearer "))
+      (subs auth 7))))
+
+(defn- check-blacklist
+  "Checks if a token is blacklisted."
+  [token]
+  (when (my-get (str "blacklist:" token))
+    {:status 401 :body {:error "Blacklisted token"}}))
+
+(defn- validate-token
+  "Validates a JWT token and checks token version."
+  [ds token path ip]
+  (if-not token
+    (do
+      (log/warn "Missing authorization token" {:path path :ip ip})
+      {:status 401 :body {:error "Missing token"}})
+    (if-let [claims (unsign-token token)]
+      (let [{:keys [username token_version]} claims
+            db-v (get-db-token-version ds username)]
+        (if (and db-v (= token_version db-v))
+          {:username username :claims claims}
           (do
-            (log/warn "Blacklisted token detected" {:path (:uri req) :ip (:remote-addr req)})
-            {:status 401 :body {:error "Blacklisted token"}})
-          (let [claims (unsign-token token)]
-            (if-not claims
-              (do
-                (log/warn "Invalid token" {:path (:uri req) :ip (:remote-addr req)})
-                {:status 401 :body {:error "Invalid token"}})
-              (let [{:keys [username token_version]} claims
-                    db-v (get-db-token-version username)]
-                (if (and db-v (= token_version db-v))
-                  (do
-                    (log/info "Authentication successful" {:username username :path (:uri req)})
-                    (handler (assoc req :identity {:username username} :claims claims)))
-                  (do
-                    (log/warn "Invalid token version" {:username username :path (:uri req) :token-version token_version :db-version db-v})
-                    {:status 401 :body {:error "Invalid token version"}}))))))))))
+            (log/warn "Invalid token version" {:username username :path path :token-version token_version :db-version db-v})
+            {:status 401 :body {:error "Invalid token version"}})))
+      (do
+        (log/warn "Invalid token" {:path path :ip ip})
+        {:status 401 :body {:error "Invalid token"}}))))
+
+(defn- auth-middleware
+  "Middleware to authenticate requests using JWT."
+  [handler]
+  (fn [req]
+    (let [token (extract-token req)
+          path (:uri req)
+          ip (:remote-addr req)]
+      (or (check-blacklist token)
+          (let [result (validate-token @ds token path ip)]
+            (if (:status result)
+              result
+              (handler (assoc req :identity {:username (:username result)} :claims (:claims result)))))))))
 
 ;; Handlers
-(defn csrf-handler [req]
+(defn- check-login-rate-limit
+  "Checks if login attempts exceed the rate limit."
+  [username ip]
+  (let [bucket (quot (current-ms) (:rate-limit-window config))
+        rate-key (str "rate:login:" (str/lower-case username) ":" bucket)
+        ttl (- (:rate-limit-window config) (mod (current-ms) (:rate-limit-window config)))
+        count (my-incr rate-key ttl)]
+    (if (> count (:rate-limit-login-attempts config))
+      (do
+        (log/warn "Login rate limit exceeded" {:username username :ip ip :count count})
+        {:status 429 :body {:error "Login Rate limit exceeded"}})
+      nil)))
+
+(defn- validate-login-input
+  "Validates login request input."
+  [username password csrf-token ip]
+  (cond
+    (not (and username password csrf-token))
+    (do
+      (log/warn "Missing login input" {:username username :ip ip})
+      {:status 400 :body {:error "Missing username, password, or CSRF token"}})
+    (not (validate-csrf @ds csrf-token nil "login"))
+    (do
+      (log/warn "Invalid CSRF token for login" {:username username :ip ip})
+      {:status 401 :body {:error "Invalid/missing CSRF token"}})))
+
+(defn- authenticate-user
+  "Authenticates a user and generates tokens."
+  [ds username password ip]
+  (let [user (find-user-by-username ds username)]
+    (if-not user
+      (do
+        (hashers/derive password {:alg :bcrypt+sha512 :iterations (:bcrypt-rounds config)})
+        (Thread/sleep (rand-int login-delay-ms))
+        (log/warn "Login failed: user not found" {:username username :ip ip})
+        (audit ds "login_failed" username ip {})
+        {:status 401 :body {:error "Invalid username or password"}})
+      (if-not (hashers/check password (:password user))
+        (do
+          (Thread/sleep (rand-int login-delay-ms))
+          (log/warn "Login failed: invalid password" {:username username :ip ip})
+          (audit ds "login_failed" username ip {})
+          {:status 401 :body {:error "Invalid username or password"}})
+        (let [db-v (:token_version user)
+              access (sign-token {:username username :token_version db-v} (:token-expiry config))
+              refresh (sign-token {:username username :token_version db-v} (:refresh-token-expiry config))
+              new-csrf (generate-csrf ds username "post-login")]
+          (update-user-last-login ds username)
+          (log/info "Login successful" {:username username :ip ip})
+          (audit ds "login_success" username ip {})
+          {:status 200 :body {:token access :refreshToken refresh :csrfToken new-csrf}})))))
+
+(defn csrf-handler
+  "Handles CSRF token generation."
+  [req]
   (let [action (get-in req [:path-params :action])
         username (get-in req [:identity :username])]
     (log/info "Generating CSRF token for action" {:action action :username username})
-    {:status 200 :body {:csrfToken (generate-csrf username action)}}))
+    {:status 200 :body {:csrfToken (generate-csrf @ds username action)}}))
 
-(defn register-handler [req]
-  (let [body (:body-params req)
-        username (sanitize (get body :username))
-        password (get body :password)
-        email (sanitize (get body :email))
-        csrf-token (get body :csrfToken)
+(defn register-handler
+  "Handles user registration."
+  [req]
+  (let [{:keys [username password email csrfToken]} (:body-params req)
+        username (sanitize username)
+        email (sanitize email)
         ip (:remote-addr req)]
     (log/info "Processing registration request" {:username username :email email :ip ip})
     (cond
-      (not (and (valid-username? username) (valid-password? password) (valid-email? email)))
+      (not (and (valid-username? username)
+                (valid-password? password)
+                (valid-email? email)))
       (do
         (log/warn "Invalid registration input" {:username username :email email :ip ip})
-        {:status 400 :body {:error "Invalid input"}})
-
-      (not (validate-csrf csrf-token nil "register"))
+        {:status 400 :body {:error "Invalid input: username (3-30 chars, alphanumeric, underscore, hyphen), password (8+ chars, uppercase, digit, special char), or email"}})
+      (not (validate-csrf @ds csrfToken nil "register"))
       (do
         (log/warn "Invalid CSRF token for registration" {:username username :ip ip})
         {:status 401 :body {:error "Invalid/missing CSRF token"}})
-
-      (user-exists? username email)
+      (user-exists? @ds username email)
       (do
         (log/warn "Username or email already exists" {:username username :email email :ip ip})
         {:status 409 :body {:error "Username or email already exists"}})
-
       :else
       (let [hashed (hashers/derive password {:alg :bcrypt+sha512 :iterations (:bcrypt-rounds config)})]
         (jdbc/with-transaction [tx @ds]
-          (jdbc/execute! tx ["INSERT INTO users (username, password, email) VALUES (?, ?, ?)" username hashed email])
+          (create-user tx username hashed email)
           (log/info "User registered successfully" {:username username :email email :ip ip})
-          (audit "register" username ip {:email email}))
+          (audit tx "register" username ip {:email email}))
         {:status 201 :body {:message "User registered successfully"}}))))
 
-(defn login-handler [req]
-  (let [body (:body-params req)
-        username (get body :username)
-        password (get body :password)
-        csrf-token (get body :csrfToken)
-        ip (:remote-addr req)
-        bucket (quot (System/currentTimeMillis) (:rate-limit-window config))
-        rate-key (str "rate:login:" (str/lower-case username) ":" bucket)
-        ttl (- (:rate-limit-window config) (mod (System/currentTimeMillis) (:rate-limit-window config)))
-        count (my-incr rate-key ttl)]
+(defn login-handler
+  "Handles user login."
+  [req]
+  (let [{:keys [username password csrfToken]} (:body-params req)
+        ip (:remote-addr req)]
     (log/info "Processing login request" {:username username :ip ip})
-    (cond
-      (> count (:rate-limit-login-attempts config))
-      (do
-        (log/warn "Login rate limit exceeded" {:username username :ip ip :count count})
-        {:status 429 :body {:error "Rate limit exceeded"}})
+    (or (check-login-rate-limit username ip)
+        (validate-login-input username password csrfToken ip)
+        (authenticate-user @ds username password ip))))
 
-      (not (validate-csrf csrf-token nil "login"))
-      (do
-        (log/warn "Invalid CSRF token for login" {:username username :ip ip})
-        {:status 401 :body {:error "Invalid/missing CSRF token"}})
-
-      :else
-      (let [user (jdbc/execute-one! @ds ["SELECT * FROM users WHERE LOWER(username) = LOWER(?)" username] {:builder-fn rs/as-unqualified-maps})]
-        (if-not user
-          (do
-            (hashers/derive password {:alg :bcrypt+sha512 :iterations (:bcrypt-rounds config)})
-            (Thread/sleep (rand-int 500))
-            (log/warn "Login failed: user not found" {:username username :ip ip})
-            (audit "login_failed" username ip {})
-            {:status 401 :body {:error "Invalid credentials"}})
-          (if-not (hashers/check password (:password user))
-            (do
-              (Thread/sleep (rand-int 500))
-              (log/warn "Login failed: invalid password" {:username username :ip ip})
-              (audit "login_failed" username ip {})
-              {:status 401 :body {:error "Invalid credentials"}})
-            (let [db-v (:token_version user)
-                  access (sign-token {:username username :token_version db-v} (:token-expiry config))
-                  refresh (sign-token {:username username :token_version db-v} (:refresh-token-expiry config))
-                  new-csrf (generate-csrf username "post-login")]
-              (jdbc/execute! @ds ["UPDATE users SET last_login = NOW() WHERE username = ?" username])
-              (log/info "Login successful" {:username username :ip ip})
-              (audit "login_success" username ip {})
-              {:status 200 :body {:token access :refreshToken refresh :csrfToken new-csrf}})))))))
-
-(defn refresh-handler [req]
-  (let [body (:body-params req)
-        refresh-token (get body :refreshToken)
-        csrf-token (get body :csrfToken)
+(defn refresh-handler
+  "Handles token refresh."
+  [req]
+  (let [{:keys [refreshToken csrfToken]} (:body-params req)
         ip (:remote-addr req)]
     (log/info "Processing token refresh request" {:ip ip})
     (cond
-      (not refresh-token)
+      (not refreshToken)
       (do
         (log/warn "Missing refresh token" {:ip ip})
         {:status 400 :body {:error "Invalid input"}})
-
+      (my-get (str "blacklist:" refreshToken))
+      (do
+        (log/warn "Blacklisted refresh token" {:ip ip})
+        {:status 401 :body {:error "Blacklisted token"}})
       :else
-      (let [claims (unsign-token refresh-token)]
-        (cond
-          (not claims)
+      (let [claims (unsign-token refreshToken)]
+        (if-not claims
           (do
             (log/warn "Invalid or expired refresh token" {:ip ip})
             {:status 401 :body {:error "Invalid/expired refresh token"}})
-
-          (my-get (str "blacklist:" refresh-token))
-          (do
-            (log/warn "Blacklisted refresh token" {:ip ip})
-            {:status 401 :body {:error "Blacklisted token"}})
-
-          :else
           (let [username (:username claims)
-                db-v (get-db-token-version username)]
+                db-v (get-db-token-version @ds username)]
             (cond
               (not (= (:token_version claims) db-v))
               (do
                 (log/warn "Invalid token version for refresh" {:username username :ip ip})
                 {:status 401 :body {:error "Invalid token version"}})
-
-              (not (validate-csrf csrf-token username "refresh"))
+              (not (validate-csrf @ds csrfToken username "refresh"))
               (do
                 (log/warn "Invalid CSRF token for refresh" {:username username :ip ip})
                 {:status 401 :body {:error "Invalid/missing CSRF token"}})
-
               :else
               (let [new-access (sign-token {:username username :token_version db-v} (:token-expiry config))
                     new-refresh (sign-token {:username username :token_version db-v} (:refresh-token-expiry config))
-                    ttl (- (:exp claims) (quot (System/currentTimeMillis) 1000))]
-                (my-set-ex (str "blacklist:" refresh-token) "1" ttl)
+                    ttl (- (:exp claims) (quot (current-ms) 1000))]
+                (my-set-ex (str "blacklist:" refreshToken) "1" ttl)
                 (log/info "Token refreshed successfully" {:username username :ip ip})
                 {:status 200 :body {:token new-access :refreshToken new-refresh}}))))))))
 
-(defn logout-handler [req]
+(defn logout-handler
+  "Handles user logout."
+  [req]
   (let [csrf (get-in req [:headers "x-csrf-token"])
         username (get-in req [:identity :username])
         claims (:claims req)
-        token (subs (get-in req [:headers "authorization"]) 7)
+        token (extract-token req)
         ip (:remote-addr req)]
     (log/info "Processing logout request" {:username username :ip ip})
-    (cond
-      (not (validate-csrf csrf username "logout"))
+    (if-not (validate-csrf @ds csrf username "logout")
       (do
         (log/warn "Invalid CSRF token for logout" {:username username :ip ip})
         {:status 401 :body {:error "Invalid/missing CSRF token"}})
-
-      :else
       (do
-        (jdbc/execute! @ds ["UPDATE users SET token_version = token_version + 1 WHERE username = ?" username])
-        (let [ttl (- (:exp claims) (quot (System/currentTimeMillis) 1000))]
+        (update-user-token-version @ds username)
+        (let [ttl (- (:exp claims) (quot (current-ms) 1000))]
           (my-set-ex (str "blacklist:" token) "1" ttl))
         (log/info "Logout successful" {:username username :ip ip})
-        (audit "logout" username ip {})
+        (audit @ds "logout" username ip {})
         {:status 200 :body {:message "Logged out successfully"}}))))
 
-(defn forgot-handler [req]
-  (let [body (:body-params req)
-        email (sanitize (get body :email))
-        csrf-token (get body :csrfToken)
+(defn forgot-handler
+  "Handles password reset requests."
+  [req]
+  (let [{:keys [email csrfToken]} (:body-params req)
+        email (sanitize email)
         ip (:remote-addr req)]
     (log/info "Processing forgot password request" {:email email :ip ip})
     (cond
@@ -567,76 +714,71 @@
       (do
         (log/warn "Invalid email for password reset" {:email email :ip ip})
         {:status 400 :body {:error "Invalid input"}})
-
-      (not (validate-csrf csrf-token nil "forgot-password"))
+      (not (validate-csrf @ds csrfToken nil "forgot-password"))
       (do
         (log/warn "Invalid CSRF token for password reset" {:email email :ip ip})
         {:status 401 :body {:error "Invalid/missing CSRF token"}})
-
       :else
-      (let [user (jdbc/execute-one! @ds ["SELECT username FROM users WHERE email = ?" email] {:builder-fn rs/as-unqualified-maps})]
+      (let [user (find-user-by-email @ds email)]
         (if user
           (let [token (str (java.util.UUID/randomUUID))
-                expires (java.sql.Timestamp. (+ (System/currentTimeMillis) (* (:password-reset-expiry config) 1000)))]
-            (jdbc/execute! @ds ["INSERT INTO password_resets (token, username, expires_at) VALUES (?, ?, ?)" token (:username user) expires])
+                expires (java.sql.Timestamp. (+ (current-ms) (* (:password-reset-expiry config) 1000)))]
+            (insert-password-reset @ds token (:username user) expires)
             (log/info "Password reset token generated" {:username (:username user) :email email :ip ip})
-            (audit "password_reset_requested" (:username user) ip {:email email})
+            (audit @ds "password_reset_requested" (:username user) ip {:email email})
             {:status 200 :body {:message "If the email exists, a reset link has been sent" :resetToken token}})
           (do
             (log/info "Password reset requested for non-existent email" {:email email :ip ip})
             {:status 200 :body {:message "If the email exists, a reset link has been sent"}}))))))
 
-(defn reset-handler [req]
-  (let [body (:body-params req)
-        token (get body :token)
-        new-password (get body :newPassword)
-        csrf-token (get body :csrfToken)
+(defn reset-handler
+  "Handles password reset with a token."
+  [req]
+  (let [{:keys [token newPassword csrfToken]} (:body-params req)
         ip (:remote-addr req)]
     (log/info "Processing password reset request" {:ip ip})
     (cond
-      (not (and token (valid-password? new-password)))
+      (not (and token (valid-password? newPassword)))
       (do
         (log/warn "Invalid input for password reset" {:ip ip})
         {:status 400 :body {:error "Invalid input"}})
-
       :else
-      (let [reset (jdbc/execute-one! @ds ["SELECT username FROM password_resets WHERE token = ? AND expires_at > NOW()" token] {:builder-fn rs/as-unqualified-maps})]
+      (let [reset (find-password-reset @ds token)]
         (cond
           (not reset)
           (do
             (log/warn "Invalid or expired password reset token" {:ip ip})
             {:status 401 :body {:error "Invalid/expired reset token"}})
-
-          (not (validate-csrf csrf-token (:username reset) "reset-password"))
+          (not (validate-csrf @ds csrfToken (:username reset) "reset-password"))
           (do
             (log/warn "Invalid CSRF token for password reset" {:username (:username reset) :ip ip})
             {:status 401 :body {:error "Invalid/missing CSRF token"}})
-
           :else
-          (let [hashed (hashers/derive new-password {:alg :bcrypt+sha512 :iterations (:bcrypt-rounds config)})]
+          (let [hashed (hashers/derive newPassword {:alg :bcrypt+sha512 :iterations (:bcrypt-rounds config)})]
             (jdbc/with-transaction [tx @ds]
-              (jdbc/execute! tx ["UPDATE users SET password = ?, token_version = token_version + 1 WHERE username = ?" hashed (:username reset)])
-              (jdbc/execute! tx ["DELETE FROM password_resets WHERE token = ?" token])
+              (update-user-password tx (:username reset) hashed)
+              (delete-password-reset tx token)
               (log/info "Password reset successful" {:username (:username reset) :ip ip})
-              (audit "password_reset" (:username reset) ip {}))
+              (audit tx "password_reset" (:username reset) ip {}))
             {:status 200 :body {:message "Password reset successfully"}}))))))
 
-(defn health-handler [_]
+(defn health-handler
+  "Handles health check requests."
+  [_]
   (log/info "Processing health check request")
   (let [db-ok (try
-                (jdbc/execute! @ds ["SELECT 1"])
+                (jdbc/execute! @ds [(:test-connection sql-queries)])
                 (log/debug "Database health check passed")
                 true
-                (catch Exception e
+                (catch java.sql.SQLException e
                   (log/error "Database health check failed" {:error (.getMessage e)})
                   false))
         redis-ok (try
-                   (when (= @store-type :redis)
-                     (wcar* (car/ping))
-                     (log/debug "Redis health check passed")
-                     true)
+                   (wcar* (car/ping))
+                   (log/debug "Redis health check passed")
+                   true
                    (catch Exception e
-                     (log/warn "Redis health check failed" {:error (.getMessage e)})
+                     (log/error "Redis health check failed" {:error (.getMessage e)})
                      false))
         jwt-ok (let [test-claims {:test 1}
                      test-token (sign-token test-claims 10)
@@ -648,28 +790,26 @@
                    (do
                      (log/error "JWT health check failed")
                      false)))
-        rate-limit-size (if (= @store-type :redis)
-                          (count (wcar* (car/keys "rate:*")))
-                          (count (filter #(.startsWith ^String % "rate:") (keys @in-memory-store))))
+        rate-limit-size (count (wcar* (car/keys "rate:*")))
         pool-stats (let [hikari-pool (.getHikariPoolMXBean ^HikariDataSource @ds)]
                      (.getTotalConnections hikari-pool))]
     (log/info "Health check completed" {:db-ok db-ok :redis-ok redis-ok :jwt-ok jwt-ok :rate-limit-size rate-limit-size :pool-stats pool-stats})
     (if (and db-ok jwt-ok)
       {:status 200 :body {:status "ok"
                           :components {:database (if db-ok "ok" "error")
-                                       :redis (if redis-ok "ok" "degraded")
+                                       :redis (if redis-ok "ok" "error")
                                        :jwt (if jwt-ok "ok" "error")
                                        :rateLimitSize rate-limit-size
                                        :poolStats pool-stats}}}
       {:status 503 :body {:status "error"
                           :components {:database (if db-ok "ok" "error")
-                                       :redis (if redis-ok "ok" "degraded")
+                                       :redis (if redis-ok "ok" "error")
                                        :jwt (if jwt-ok "ok" "error")
                                        :rateLimitSize rate-limit-size
                                        :poolStats pool-stats}}})))
 
 ;; App
-(def muuntaja (m/create m/default-options))
+(def ^:private muuntaja (m/create m/default-options))
 
 (def app
   (ring/ring-handler
@@ -703,11 +843,13 @@
                    {:status 404 :headers {"Content-Type" "application/json"} :body (cheshire/encode {:error "Not found"})})})))
 
 ;; Server
-(def server (atom nil))
-(def cleanup-rate-thread (atom nil))
-(def cleanup-blacklist-thread (atom nil))
+(def ^:private server (atom nil))
+(def ^:private cleanup-rate-thread (atom nil))
+(def ^:private cleanup-blacklist-thread (atom nil))
 
-(defn start []
+(defn start
+  "Starts the auth server."
+  []
   (log/info "Starting auth server")
   (init-db)
   (init-redis)
@@ -718,7 +860,9 @@
   (reset! server (jetty/run-jetty #'app {:port (:port config) :join? false}))
   (log/info "Auth server started" {:port (:port config)}))
 
-(defn stop []
+(defn stop
+  "Stops the auth server."
+  []
   (log/info "Stopping auth server")
   (future-cancel @cleanup-rate-thread)
   (log/info "Stopped rate limit cleanup thread")
@@ -731,7 +875,9 @@
     (hikari/close-datasource @ds)
     (log/info "Database datasource closed")))
 
-(defn -main [& _]
+(defn -main
+  "Main entry point for the auth server."
+  [& _]
   (log/info "Main function invoked")
   (.addShutdownHook (Runtime/getRuntime) (Thread. stop))
   (start))
