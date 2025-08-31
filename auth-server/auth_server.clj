@@ -6,7 +6,6 @@
             [reitit.ring.middleware.exception :as exception]
             [reitit.ring.middleware.parameters :as parameters]
             [muuntaja.core :as m]
-            [ring.middleware.cors :refer [wrap-cors]]
             [environ.core :refer [env]]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
@@ -323,6 +322,38 @@
           (assoc-in [:headers "Content-Security-Policy"] "default-src 'self'; script-src 'self'; object-src 'none'")
           (assoc-in [:headers "X-Content-Type-Options"] "nosniff")
           (assoc-in [:headers "X-Frame-Options"] "DENY")))))
+
+(defn cors-middleware [handler allowed-origins]
+  (fn [req]
+    (let [headers (into {} (map (fn [[k v]] [(clojure.string/lower-case k) v]) (:headers req)))
+          origin (get headers "origin")
+          acrm (get headers "access-control-request-method")
+          acrih (get headers "access-control-request-headers")
+          allowed-methods #{"GET" "POST" "OPTIONS"}
+          allowed-headers #{"content-type" "authorization" "x-csrf-token" "x-requested-with"}]
+      (if (= (:request-method req) :options)
+        ;; Handle preflight request
+        (if (and origin
+                 (contains? allowed-origins origin)
+                 (or (nil? acrm) (contains? allowed-methods (clojure.string/upper-case acrm)))
+                 (or (nil? acrih) 
+                     (every? #(contains? allowed-headers (clojure.string/lower-case (clojure.string/trim %))) 
+                             (clojure.string/split acrih #","))))
+          {:status 200
+           :headers {"Access-Control-Allow-Origin" origin
+                     "Access-Control-Allow-Methods" "GET,POST,OPTIONS"
+                     "Access-Control-Allow-Headers" "Content-Type,Authorization,X-CSRF-Token,X-Requested-With"
+                     "Access-Control-Max-Age" "86400"
+                     "Vary" "Origin"}}
+          {:status 403 :body {:error "CORS preflight request denied"}})
+        ;; Handle regular request
+        (let [resp (handler req)]
+          (if (and origin (contains? allowed-origins origin))
+            (assoc-in resp [:headers] 
+                      (merge (:headers resp)
+                             {"Access-Control-Allow-Origin" origin
+                              "Vary" "Origin"}))
+            resp))))))
 
 (defn logger-middleware [handler]
   (fn [req]
@@ -665,10 +696,7 @@
                          secure-headers-middleware
                          logger-middleware
                          (fn [handler]
-                           (wrap-cors handler
-                                      :access-control-allow-origin (:allowed-origins config)
-                                      :access-control-allow-methods [:get :post :options]
-                                      :access-control-allow-headers ["Content-Type" "Authorization" "X-CSRF-Token"]))]}})
+                           (cors-middleware handler (:allowed-origins config)))]}})
    (ring/create-default-handler
      {:not-found (fn [_]
                    (log/warn "Route not found")

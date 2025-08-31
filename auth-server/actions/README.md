@@ -33,6 +33,18 @@ This directory contains shell scripts for testing the authentication server's fu
    - Valid registration
    - Duplicate registration prevention
 
+## Dynamic Test Runner
+
+**run_all_tests.sh** - A dynamic test runner that automatically discovers and executes all test scripts in this directory:
+
+```bash
+./run_all_tests.sh          # Run all tests
+./run_all_tests.sh --list   # List all discovered test scripts
+./run_all_tests.sh --help   # Show help message
+```
+
+This script excludes itself when discovering test scripts, so you can add or remove test scripts without needing to update the runner.
+
 ## Prerequisites
 
 - `curl` must be installed
@@ -55,6 +67,12 @@ Then run any script:
 ./test_rate_limiting.sh
 ./test_server_health.sh
 ./test_input_validation.sh
+```
+
+Or run all tests at once:
+
+```bash
+./run_all_tests.sh
 ```
 
 ## Environment
