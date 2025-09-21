@@ -113,7 +113,6 @@ graph TD
     F[Consumer Service] -->|WebSocket /watch| B
     E -->|Notify| B
     B -->|Push Update| F
-    G[NGINX Load Balancer] --> B
     H[JWT Validator] --> B
 ```
 
@@ -230,7 +229,6 @@ DynConfig is implemented in **Clojure**, leveraging immutability and concurrency
 ### Testing
 - Validate health: `curl http://localhost:8080/health`.
 - Simulate propagation: Use the example client to subscribe and update a key.
-- Changelog: See [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 Feedback and contributions are welcome! Please submit issues or PRs to refine the API, security model, or propagation logic. Run `lein test` before submitting.
