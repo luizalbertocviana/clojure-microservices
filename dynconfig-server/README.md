@@ -1,6 +1,6 @@
 # DynConfig Server
 
-DynConfig is a centralized, secure configuration management system designed as a key-value store that supports real-time configuration updates and propagation to consuming services without requiring restarts. It uses a RESTful HTTP API with WebSocket-based change notifications and enforces strict access control using JSON Web Tokens (JWTs).
+DynConfig is a centralized, secure configuration management system designed as a key-value store that supports real-time configuration updates and propagation to consuming services without requiring restarts. It uses a RESTful HTTP API with WebSocket-based change notifications and enforces strict access control using JSON Web Tokens (JWTs) containing a `username` claim.
 
 ## Intended Audience
 
@@ -11,7 +11,7 @@ This documentation is intended for developers, DevOps engineers, and system arch
 DynConfig enables:
 - **Dynamic Updates**: Producers (e.g., admin services) register or update key-value pairs via HTTP.
 - **Real-Time Propagation**: Consumers (e.g., application services) receive updates via WebSockets, updating in-memory configurations without restarts.
-- **Security**: Per-key access control lists (ACLs) restrict read/write access to authorized entities, authenticated via JWTs.
+- **Security**: Per-key access control lists (ACLs) restrict read/write access to authorized entities, authenticated via JWTs with a `username` claim.
 - **Scalability and Reliability**: Built with Clojure, PostgreSQL for persistent storage, and Redis for caching and event propagation.
 
 ### Key Principles
@@ -24,7 +24,7 @@ DynConfig enables:
   - **Key**: Unique string identifier (e.g., `app.feature-toggle.enabled`), supporting hierarchical paths (e.g., `namespace/app/key`).
   - **Value**: JSON-serializable data (string, boolean, number), max 1MB.
   - **Metadata**: Includes TTL (optional), version, ACLs (read/write lists or wildcards), and last-modified timestamp.
-  - **Entities**: Identified by JWT `sub` claim (user/service ID).
+  - **Entities**: Identified by JWT `username` claim (user/service ID).
 
 ## Use Cases
 
@@ -65,7 +65,7 @@ Run with `docker-compose up`.
 
 ### Example Usage
 
-1. **Authenticate**: Obtain a JWT with `scope: dynconfig:write` for admin actions.
+1. **Authenticate**: Obtain a JWT containing a `username` claim for admin actions.
 
 2. **Create a Key**:
    ```bash
@@ -77,11 +77,11 @@ Run with `docker-compose up`.
        "ttl": 3600,
        "acls": {
          "read": ["*"],
-         "write": ["role:admin"]
+         "write": ["admin-user"]
        }
      }'
    ```
-   Response: `{"key": "app.feature-toggle.enabled", "version": 1, "lastModified": "2025-09-10T20:03:00Z"}`
+   Response: `{"key": "app.feature-toggle.enabled", "version": 1, "lastModified": "2025-09-21T20:03:00Z"}`
 
 3. **Fetch a Key**:
    ```bash
@@ -134,12 +134,12 @@ This diagram illustrates the flow: Producers update via HTTP, stored in PostgreS
   - Client libraries update in-memory configs via callbacks.
 
 ### API Endpoints
-All requests require `Authorization: Bearer <jwt>`.
+All requests require `Authorization: Bearer <jwt>` with a valid `username` claim.
 
 | Method | Endpoint | Description | Request Body | Response |
 |--------|----------|-------------|--------------|----------|
-| PUT | `/keys/{key}` | Create or replace key | `{ "value": "true", "ttl": 3600, "acls": { "read": ["*"], "write": ["role:admin"] } }` | `{ "key": "app.feature-toggle.enabled", "version": 1, "lastModified": "2025-09-10T20:03:00Z" }` |
-| PATCH | `/keys/{key}` | Update key value only | `{ "value": "false" }` | `{ "key": "app.feature-toggle.enabled", "version": 2, "lastModified": "2025-09-10T20:05:00Z" }` |
+| PUT | `/keys/{key}` | Create or replace key | `{ "value": "true", "ttl": 3600, "acls": { "read": ["*"], "write": ["admin-user"] } }` | `{ "key": "app.feature-toggle.enabled", "version": 1, "lastModified": "2025-09-21T20:03:00Z" }` |
+| PATCH | `/keys/{key}` | Update key value only | `{ "value": "false" }` | `{ "key": "app.feature-toggle.enabled", "version": 2, "lastModified": "2025-09-21T20:05:00Z" }` |
 | GET | `/keys/{key}` | Fetch key value | None | `{ "key": "app.feature-toggle.enabled", "value": "false", "version": 2 }` |
 | DELETE | `/keys/{key}` | Delete key (soft-delete) | None | 204 No Content |
 | GET | `/keys` | List keys | Query: `?namespace=app&limit=100` | `{ "keys": ["app.key1", "app.key2"], "total": 2 }` |
@@ -157,20 +157,19 @@ All requests require `Authorization: Bearer <jwt>`.
 
 ## Security
 - **Authentication**:
-  - JWTs validated via a JWKS endpoint.
-  - `sub` (entity ID), `scope` (e.g., `dynconfig:write`).
+  - JWTs validated via a JWKS endpoint, containing only a `username` claim.
   - Tokens are short-lived (e.g., 1h).
 - **Authorization**:
   - Per-key ACLs defined at creation:
 
         {
-          "read": ["service:payment-api", "role:ops"],
-          "write": ["role:admin"]
+          "read": ["service:payment-api", "admin-user"],
+          "write": ["admin-user"]
         }
 
   - Wildcards allowed (`"read": ["*"]`).
   - Namespace-level ACLs optional for inheritance.
-  - `role:admin` may update metadata and override.
+  - Users with `admin-user` in ACLs may update metadata and override.
 - **Auditing**:
   - All operations logged (who, what, when).
   - Logs persisted in PostgreSQL; optionally streamed to Kafka/ELK.
@@ -220,7 +219,7 @@ DynConfig is implemented in **Clojure**, leveraging immutability and concurrency
 - `buddy-auth` — JWT handling.
 
 ### Deployment Notes
-- Validate JWTs against a JWKS endpoint.
+- Validate JWTs against a JWKS endpoint, ensuring a valid `username` claim.
 - Configure PostgreSQL for durability and Redis for event distribution.
 - Export Prometheus metrics (latency, error rates, connection counts).
 - Audit logs replicated to a secure system.
