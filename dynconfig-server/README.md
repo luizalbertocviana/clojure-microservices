@@ -157,7 +157,7 @@ All requests require `Authorization: Bearer <jwt>` with a valid `username` claim
 
 ## Security
 - **Authentication**:
-  - JWTs validated via a JWKS endpoint, containing only a `username` claim.
+  - JWTs validated via a JWKS endpoint, containing a `username` claim.
   - Tokens are short-lived (e.g., 1h).
 - **Authorization**:
   - Per-key ACLs defined at creation:
